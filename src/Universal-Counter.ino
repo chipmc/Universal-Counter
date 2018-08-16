@@ -21,7 +21,7 @@ namespace FRAM {                                    // Moved to namespace instea
   enum Addresses {
     versionAddr           = 0x0,                    // Where we store the memory map version number
     resetCountAddr        = 0x1,                    // Sensitivity for Accelerometer sensors
-    minTransitAddr        = 0x2,                    // Where we store debounce in cSec or 1/10s of a sec (ie 1.6sec is stored as 16)
+    minTransitAddr        = 0x2,                    // Where we store debounce in dSec or 1/10s of a sec (ie 1.6sec is stored as 16)
     maxGroupAddr          = 0x3,                    // This is where we keep track of how often the Electron was reset
     timeZoneAddr          = 0x4,                    // Store the local time zone data
     openTimeAddr          = 0x5,                    // Hour for opening the park / store / etc - military time (e.g. 6 is 6am)
@@ -37,7 +37,7 @@ namespace FRAM {                                    // Moved to namespace instea
 
 // Finally, here are the variables I want to change often and pull them all together here
 const int versionNumber = 9;                        // Increment this number each time the memory map is changed
-const char releaseNumber[6] = "0.15";               // Displays the release on the menu
+const char releaseNumber[6] = "0.1";               // Displays the release on the menu
 
 // Included Libraries
 #include "Adafruit_FRAM_I2C.h"        // Library for FRAM functions
@@ -70,7 +70,9 @@ const int donePin =       D6;                     // Pin the Electron uses to "p
 const int blueLED =       D7;                     // This LED is on the Electron itself
 
 // Timing Variables
-const unsigned long stayAwake = 90000;            // In lowPowerMode, how long to stay awake every hour
+unsigned long stayAwake;                          // This is the time before sleeping - can be short or long
+bool awokeFromNap=false;                          // Flag that napping was interrupted by interrupt not time
+const unsigned long stayAwakeLong = 90000;        // In lowPowerMode, how long to stay awake every hour - long
 const unsigned long webhookWait = 45000;          // How long will we wair for a WebHook response
 const unsigned long resetWait = 30000;            // How long will we wait in ERROR_STATE until reset
 const int publishFrequency = 1000;                // We can only publish once a second
@@ -117,17 +119,17 @@ volatile unsigned long currentEvent = 0;    // Time for the current sensor event
 volatile bool pinState = false;             // Pin change interrupt so need to capture state
 unsigned long startDetect = 0;              // When was the sensor event start - intPin goes HIGH
 unsigned long stopDetect = 0;               // When did sensor event stop - intPin goes LOW
-int maxGroup=1;                            // What is the biggest group that will walk together - prevents large counts if someone stops in front of the sensor
+int maxGroup=1;                             // What is the biggest group that will walk together - prevents large counts if someone stops in front of the sensor
 int hourlyPersonCount = 0;                  // hourly counter
 int hourlyPersonCountSent = 0;              // Person count in flight to Ubidots
 int dailyPersonCount = 0;                   // daily counter
-char transitTimeStr[8] = "NA";                     // String to communicate transit time to app
-char minTransitStr[8] = "NA";                     // String to communicate transit time to app
-float minTransit=1.0;                           // Ths is the minimum time needed to transit the field in sec to tenths
+char transitTimeStr[8] = "NA";              // String to communicate transit time to app
+char minTransitStr[8] = "NA";               // String to communicate transit time to app
+float minTransit;                           // Ths is the minimum time needed to transit the field in sec to tenths
 
 void setup()                                // Note: Disconnected Setup()
 {
-  Wire.begin();                             // Create a waire object
+  Wire.begin();                             // Create a wire object
 
   pinMode(enablePin,OUTPUT);                // For GPS enabled units
   digitalWrite(enablePin,LOW);              // Turn off GPS to save battery
@@ -174,99 +176,97 @@ void setup()                                // Note: Disconnected Setup()
   Particle.function("SetOpenTime",setOpenTime);
   Particle.function("SetClose",setCloseTime);
 
-delay(2000);
-
-  if (!fram.begin()) {                                                  // You can stick the new i2c addr in here, e.g. begin(0x51);
-    resetTimeStamp = millis();
+  if (!fram.begin()) {                                                // You can stick the new i2c addr in here, e.g. begin(0x51);
+    resetTimeStamp = millis();                                        // FRAM failed to initialize, reset
     state = ERROR_STATE;
   }
-  else if (FRAMread8(FRAM::versionAddr) != versionNumber) {                   // Check to see if the memory map in the sketch matches the data on the chip
-    ResetFRAM();                                                        // Reset the FRAM to correct the issue
+  else if (FRAMread8(FRAM::versionAddr) != versionNumber) {           // Check to see if the memory map in the sketch matches the data on the chip
+    ResetFRAM();                                                      // Reset the FRAM to correct the issue
     if (FRAMread8(FRAM::versionAddr) != versionNumber) {
       resetTimeStamp = millis();
-      state = ERROR_STATE;   // Resetting did not fix the issue
+      state = ERROR_STATE;                                            // Resetting did not fix the issue
     }
     else {
-      FRAMwrite8(FRAM::controlRegisterAddr,0);                                    // Need to reset so not in low power or low battery mode
-      FRAMwrite8(FRAM::openTimeAddr,0);                                       // These set the defaults if the FRAM is erased
-      FRAMwrite8(FRAM::closeTimeAddr,24);                                     // This will ensure the device does not sleep
-      FRAMwrite8(FRAM::minTransitAddr,1);
+      FRAMwrite8(FRAM::controlRegisterAddr,0);                        // Need to reset so not in low power or low battery mode
+      FRAMwrite8(FRAM::openTimeAddr,0);                               // These set the defaults if the FRAM is erased
+      FRAMwrite8(FRAM::closeTimeAddr,24);                             // This will ensure the device does not sleep
+      FRAMwrite8(FRAM::minTransitAddr,20);                            // Min transit is stored in 10ths of a second
       FRAMwrite8(FRAM::maxGroupAddr,4);
     }
   }
 
-  resetCount = FRAMread8(FRAM::resetCountAddr);                                   // Retrive system recount data from FRAM
-  if (System.resetReason() == RESET_REASON_PIN_RESET)                   // Check to see if we are starting from a pin reset
+  resetCount = FRAMread8(FRAM::resetCountAddr);                       // Retrive system recount data from FRAM
+  if (System.resetReason() == RESET_REASON_PIN_RESET)                 // Check to see if we are starting from a pin reset
   {
     resetCount++;
-    FRAMwrite8(FRAM::resetCountAddr,static_cast<uint8_t>(resetCount));            // If so, store incremented number - watchdog must have done This
+    FRAMwrite8(FRAM::resetCountAddr,static_cast<uint8_t>(resetCount));// If so, store incremented number - watchdog must have done This
   }
 
   // Here we load the values from FRAM
-  minTransit= float(FRAMread8(FRAM::minTransitAddr))/10.0;                             // The time to cross the sensor's field of view in seconds
+  minTransit = float(FRAMread8(FRAM::minTransitAddr))/10.0;           // The time to cross the sensor's field of view in seconds (PIR only)
   snprintf(minTransitStr,sizeof(minTransitStr),"%2.1f sec",minTransit);
-  Serial.print("The elements are FRAM::minTransitAddr:");
+  Serial.print("The elements are minTransitAddr:");
   Serial.print(FRAMread8(FRAM::minTransitAddr));
   Serial.print(" and minTransit: ");
   Serial.println(minTransit);
-  maxGroup = FRAMread8(FRAM::maxGroupAddr);
-  openTime = FRAMread8(FRAM::openTimeAddr);
-  closeTime = FRAMread8(FRAM::closeTimeAddr);
+  maxGroup = FRAMread8(FRAM::maxGroupAddr);                           // How many people might walk together (PIR only)
+  openTime = FRAMread8(FRAM::openTimeAddr);                           // Open time of the park (24 hour format)
+  closeTime = FRAMread8(FRAM::closeTimeAddr);                         // Close time of the park (24 hr format)
 
-  int8_t tempTimeZoneOffset = FRAMread8(FRAM::timeZoneAddr);                      // Load Time zone data from FRAM
+  int8_t tempTimeZoneOffset = FRAMread8(FRAM::timeZoneAddr);          // Load Time zone data from FRAM
   if (tempTimeZoneOffset <= 12 && tempTimeZoneOffset >= -12)  Time.zone((float)tempTimeZoneOffset);  // Load Timezone from FRAM
-  else Time.zone(-4);                                                   // Default is EST in case proper value not in FRAM
+  else Time.zone(-4);                                                 // Default is EST in case proper value not in FRAM
 
   // And set the flags from the control register
-  controlRegisterValue = FRAMread8(FRAM::controlRegisterAddr);                         // Read the Control Register for system modes so they stick even after reset
-  lowPowerMode    = (0b00000001 & controlRegisterValue);                     // Set the lowPowerMode
-  solarPowerMode  = (0b00000100 & controlRegisterValue);                     // Set the solarPowerMode
-  verboseMode     = (0b00001000 & controlRegisterValue);                     // Set the verboseMode
-  connectionMode  = (0b00010000 & controlRegisterValue);                   // connected mode 1 = connected and 0 = disconnected
+  controlRegisterValue = FRAMread8(FRAM::controlRegisterAddr);        // Read the Control Register for system modes so they stick even after reset
+  lowPowerMode    = (0b00000001 & controlRegisterValue);              // Set the lowPowerMode
+  solarPowerMode  = (0b00000100 & controlRegisterValue);              // Set the solarPowerMode
+  verboseMode     = (0b00001000 & controlRegisterValue);              // Set the verboseMode
+  connectionMode  = (0b00010000 & controlRegisterValue);              // connected mode 1 = connected and 0 = disconnected
 
-  PMICreset();                                                          // Executes commands that set up the PMIC for Solar charging - once we know the Solar Mode
+  PMICreset();                                                        // Executes commands that set up the PMIC for Solar charging - once we know the Solar Mode
 
-  takeMeasurements();                                                   // For the benefit of monitoring the device
+  takeMeasurements();                                                 // For the benefit of monitoring the device
 
   if (connectionMode) connectToParticle();                            // If not lowpower or sleeping, we can connect
 
-  currentHourlyPeriod = Time.hour();                                    // Sets the hour period for when the count starts (see #defines)
-  currentDailyPeriod = Time.day();                                      // And the day  (see #defines)
-  // Deterimine when the last counts were taken check when starting test to determine if we reload values or start counts over
-  time_t unixTime = FRAMread32(FRAM::currentCountsTimeAddr);                      // Need to reload program control since reset
-  lastHour = Time.hour(unixTime);
+  currentHourlyPeriod = Time.hour();                                  // Sets the hour period for when the system starts
+  currentDailyPeriod = Time.day();                                    // And the day
+  time_t unixTime = FRAMread32(FRAM::currentCountsTimeAddr);          // Need to reload program control since reset
+  lastHour = Time.hour(unixTime);                                     // Extract hour and day from last count
   lastDate = Time.day(unixTime);
-  dailyPersonCount = FRAMread16(FRAM::currentDailyCountAddr);                     // Load Daily Count from memory
-  hourlyPersonCount = FRAMread16(FRAM::currentHourlyCountAddr);                   // Load Hourly Count from memory
+  dailyPersonCount = FRAMread16(FRAM::currentDailyCountAddr);         // Load Daily Count from memory
+  hourlyPersonCount = FRAMread16(FRAM::currentHourlyCountAddr);       // Load Hourly Count from memory
 
-  while(pinReadFast(intPin));                                           // Make sure that the int Pin is low before starting
-  attachInterrupt(wakeUpPin, watchdogISR, RISING);                      // The watchdog timer will signal us and we have to respond
-  attachInterrupt(intPin,sensorISR,CHANGE);                             // Will know when the PIR sensor is triggered
 
-  if (!digitalRead(userSwitch)) {                                     // Rescue mode to locally take lowPowerMode so you can connect to device
+  while(pinReadFast(intPin) && millis() < resetWait);                 // Make sure that the int Pin is low before starting
+  if (pinReadFast(intPin)) {                                          // Something is wrong - intPin should have cleared so will reset
+    resetTimeStamp = millis();                                        // Send this to the ERROR_STATE
+    state = ERROR_STATE;                                              // *** Need to improve this *** add logic to power cycle the sensor board
+  }
+  attachInterrupt(wakeUpPin, watchdogISR, RISING);                    // The watchdog timer will signal us and we have to respond
+  attachInterrupt(intPin,sensorISR,CHANGE);                           // Will know when the PIR sensor is triggered
+
+  if (!pinReadFast(userSwitch)) {                                     // Rescue mode to locally take lowPowerMode so you can connect to device
     lowPowerMode = false;                                             // Press the user switch while resetting the device
-    controlRegisterValue = (0b11111110 & controlRegisterValue);                  // Turn off Low power mode
-    controlRegisterValue = (0b00010000 | controlRegisterValue);                 // Turn on the connectionMode
-    FRAMwrite8(FRAM::controlRegisterAddr,controlRegisterValue);                      // Write it to the register
+    controlRegisterValue = (0b11111110 & controlRegisterValue);       // Turn off Low power mode
+    controlRegisterValue = (0b00010000 | controlRegisterValue);       // Turn on the connectionMode
+    FRAMwrite8(FRAM::controlRegisterAddr,controlRegisterValue);       // Write it to the register
     openTime = 0;                                                     // Device may alos be sleeping due to time or TimeZone setting
-    FRAMwrite8(FRAM::openTimeAddr,0);                                       // Reset open and close time values to ensure device is awake
+    FRAMwrite8(FRAM::openTimeAddr,0);                                 // Reset open and close time values to ensure device is awake
     closeTime = 24;
     FRAMwrite8(FRAM::closeTimeAddr,24);
     connectToParticle();                                              // Connects the Electron to Particle so you can control it
     Particle.publish("Startup","Startup rescue - reset time and power");
   }
 
-  if (state != ERROR_STATE) state = IDLE_STATE;                         // IDLE unless error from above code
+  if (state != ERROR_STATE) state = IDLE_STATE;                       // IDLE unless error from above code
+
+  stayAwake = stayAwakeLong;
 }
 
 void loop()
 {
-  if(verboseMode && watchDogPet) {
-    waitUntil(meterParticlePublish);
-    Particle.publish("Watchdog","Petted");
-    watchDogPet = false;
-    lastPublish = millis();
-  }
   switch(state) {
   case IDLE_STATE:
     if (connectionMode && verboseMode && state != oldState) publishStateTransition();
@@ -295,7 +295,7 @@ void loop()
         delay(2000);                                                    // Advice from Rickkas - https://community.particle.io/t/electron-sleep-problems-yet-again/42230/11
       }
       detachInterrupt(intPin);                                          // Done sensing for the day
-      FRAMwrite16(FRAM::currentDailyCountAddr, 0);                                // Reset the counts in FRAM
+      FRAMwrite16(FRAM::currentDailyCountAddr, 0);                      // Reset the counts in FRAM
       FRAMwrite8(FRAM::resetCountAddr, 0);
       FRAMwrite16(FRAM::currentHourlyCountAddr, 0);
       dailyPersonCount = resetCount = hourlyPersonCount = 0; // All the counts have been reported so time to zero everything
@@ -310,12 +310,17 @@ void loop()
 
   case NAPPING_STATE: {  // This state puts the device in low power mode quickly
       if (connectionMode && verboseMode && state != oldState) publishStateTransition();
+      if (pinState) break;                                              // Don't nap until we are done with event
       if (Particle.connected()) Cellular.off();                         // If connected, we need to disconned and power down the modem
       digitalWrite(blueLED,LOW);                                        // Turn off the LED
       watchdogISR();                                                    // Pet the watchdog
+      stayAwake = minTransit*1000;                                      // Need to convert to millis
       int secondsToHour = (60*(60 - Time.minute()));                    // Time till the top of the hour
       System.sleep(intPin, RISING, secondsToHour);                      // Sensor will wake us with an interrupt or timeout at the hour
-      if (System.wokenUpByPin()) sensorISR();                           // Run the ISR if work by pin
+      if (System.wokenUpByPin()) {
+         awokeFromNap=true;                                             // Since millis() stops when sleeping - need this to debounce
+         stayAwakeTimeStamp = millis();
+      }
       state = IDLE_STATE;                                               // Back to the IDLE_STATE after a nap
     } break;
 
@@ -382,49 +387,49 @@ void recordCount()                                          // Handles counting 
   char data[256];                                           // Store the date in this character array - not global
   sensorDetect = false;                                     // Reset the flag
   if (pinState) {
+    if ((millis() >= startDetect + minTransit*1000 || awokeFromNap)) {
     startDetect = currentEvent;
-    Serial.print("Start = ");
-    Serial.print(startDetect);
-    return;
-  }
-  else {                                                    // 1st attempt will fail if there are too many retriggers
-    stopDetect = currentEvent;
-    Serial.print(" Stop = ");
-    Serial.print(stopDetect);
-    Serial.print(" Stop-Start = ");
-    Serial.println(stopDetect-startDetect);
-    float timeLapsed = (stopDetect - startDetect) / 1000.0;   // This is the time between this event and last
-    //if (timeLapsed < minTransit) return;                    // Too short - must be noise
-    //else {
-      if (minTransit == 0) minTransit = 1.0;                 // Cannot allow a divide by zero here
-      Serial.print("timeLapsed: ");
-      Serial.print(timeLapsed);
-      Serial.print(" and minTransit: ");
-      Serial.print(minTransit);
-      Serial.print(" so timeLapsed / minTransit = ");
-      Serial.println(timeLapsed/minTransit);
-
-      int peopleInGroup = constrain(int(timeLapsed / minTransit),1,maxGroup);   // This will count multiples if longer signal
-      hourlyPersonCount += peopleInGroup;
-      dailyPersonCount += peopleInGroup;
-      FRAMwrite16(FRAM::currentHourlyCountAddr, static_cast<uint16_t>(hourlyPersonCount));  // Load Hourly Count to memory
-      FRAMwrite16(FRAM::currentDailyCountAddr, static_cast<uint16_t>(dailyPersonCount));   // Load Daily Count to memory
-      snprintf(transitTimeStr, sizeof(transitTimeStr),"%2.1f sec",timeLapsed);
-      if (verboseMode) {                                          // Publish if we are in verbose mode
-        snprintf(data, sizeof(data), "Group of %i so %i hourly and transit of %2.1f seconds", peopleInGroup,hourlyPersonCount,timeLapsed);
-        Particle.publish("Count",data);                     // Don't meter this publish as it cold mess with timing
-      }
-    //}
-  }
-  if (!digitalRead(userSwitch)) {                          // A low value means someone is pushing this button take out of low power mode
-    if (lowPowerMode) {
-      lowPowerMode = false;
-      connectToParticle();                                 // Reconnect to Particle for monitoring and management
-      Particle.publish("Mode","Normal Operations");
-      controlRegisterValue = FRAMread8(FRAM::controlRegisterAddr);        // Load the control register contents
-      controlRegisterValue = (0b11111110 & controlRegisterValue);     // Will set the lowPowerMode bit to zero
-      FRAMwrite8(FRAM::controlRegisterAddr,controlRegisterValue);
+  //  Serial.print("Start = ");
+  //  Serial.print(startDetect);
     }
+  }
+  else if (!pinState) {                                     // 1st attempt will fail if there are too many retriggers
+    if (awokeFromNap) currentEvent+=minTransit*1000;
+    stopDetect = currentEvent;
+  //  Serial.print(" Stop = ");
+  //  Serial.print(stopDetect);
+  //  Serial.print(" Stop-Start = ");
+//    Serial.println(stopDetect-startDetect);
+    float timeLapsed = (stopDetect - startDetect) / 1000.0;   // This is the time between this event and last
+    if (minTransit == 0) minTransit = 1.0;                 // Cannot allow a divide by zero here
+  //  Serial.print("timeLapsed: ");
+  //  Serial.print(timeLapsed);
+//    Serial.print("sec and minTransit: ");
+  //  Serial.print(minTransit);
+  //  Serial.print("sec so timeLapsed / minTransit = ");
+  //  Serial.println(timeLapsed/minTransit);
+    int peopleInGroup = constrain(int(timeLapsed / minTransit),1,maxGroup);   // This will count multiples if longer signal
+    hourlyPersonCount += peopleInGroup;
+    dailyPersonCount += peopleInGroup;
+    FRAMwrite16(FRAM::currentHourlyCountAddr, static_cast<uint16_t>(hourlyPersonCount));  // Load Hourly Count to memory
+    FRAMwrite16(FRAM::currentDailyCountAddr, static_cast<uint16_t>(dailyPersonCount));   // Load Daily Count to memory
+    snprintf(transitTimeStr, sizeof(transitTimeStr),"%2.1f sec",timeLapsed);
+    if (verboseMode) {                                          // Publish if we are in verbose mode
+      snprintf(data, sizeof(data), "Group of %i so %i hourly and transit of %2.1f seconds", peopleInGroup,hourlyPersonCount,timeLapsed);
+      Particle.publish("Count",data);                     // Don't meter this publish as it cold mess with timing
+    }
+//    Serial.println(data);
+  }
+  awokeFromNap = false;                                    // Reset the flag
+  if (!pinReadFast(userSwitch) && lowPowerMode) {          // A low value means someone is pushing this button take out of low power mode
+    lowPowerMode = false;
+    connectionMode = true;
+    connectToParticle();                                 // Reconnect to Particle for monitoring and management
+    Particle.publish("Mode","Normal Operations");
+    controlRegisterValue = FRAMread8(FRAM::controlRegisterAddr);    // Load the control register contents
+    controlRegisterValue = (0b11111110 & controlRegisterValue);     // Will set the lowPowerMode bit to zero
+    controlRegisterValue = (0b00010000 | controlRegisterValue);     // Turn on the connectionMode
+    FRAMwrite8(FRAM::controlRegisterAddr,controlRegisterValue);
   }
 }
 
@@ -750,7 +755,7 @@ int setCloseTime(String command)
 {
   char * pEND;
   int tempTime = strtol(command,&pEND,10);                       // Looks for the first integer and interprets it
-  if ((tempTime < 0) || (tempTime > 24)) return 0;   // Make sure it falls in a valid range or send a "fail" result
+  if ((tempTime < 18) || (tempTime > 24)) return 0;   // Make sure it falls in a valid range or send a "fail" result
   closeTime = tempTime;
   FRAMwrite8(FRAM::closeTimeAddr,closeTime);                             // Store the new value in FRAMwrite8
   if (verboseMode) {
@@ -767,7 +772,7 @@ int setCloseTime(String command)
 int setLowPowerMode(String command)                                   // This is where we can put the device into low power mode if needed
 {
   if (command != "1" && command != "0") return 0;                     // Before we begin, let's make sure we have a valid input
-  controlRegisterValue = FRAMread8(FRAM::controlRegisterAddr);        // Get the control register (generla approach)
+  controlRegisterValue = FRAMread8(FRAM::controlRegisterAddr);        // Get the control register (general approach)
   if (command == "1")                                                 // Command calls for setting lowPowerMode
   {
     if (verboseMode) {
@@ -776,7 +781,9 @@ int setLowPowerMode(String command)                                   // This is
       lastPublish = millis();
     }
     controlRegisterValue = (0b00000001 | controlRegisterValue);       // If so, flip the lowPowerMode bit
+    controlRegisterValue = (0b11101111 & controlRegisterValue);       // Turn off connected mode 1 = connected and 0 = disconnected
     lowPowerMode = true;
+    connectionMode = false;
   }
   else if (command == "0")                                            // Command calls for clearing lowPowerMode
   {
@@ -785,8 +792,10 @@ int setLowPowerMode(String command)                                   // This is
       Particle.publish("Mode","Normal Operations");
       lastPublish = millis();
     }
-    controlRegisterValue = (0b11111110 & controlRegisterValue);      // If so, flip the lowPowerMode bit
+    controlRegisterValue = (0b11111110 & controlRegisterValue);      // If so, turn off the lowPowerMode bit
+    controlRegisterValue = (0b00010000 | controlRegisterValue);      // Turn on connected mode 1 = connected and 0 = disconnected
     lowPowerMode = false;
+    connectionMode = true;
   }
   FRAMwrite8(FRAM::controlRegisterAddr,controlRegisterValue);        // Write to the control register
   return 1;
