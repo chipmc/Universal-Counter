@@ -37,7 +37,7 @@ namespace FRAM {                                    // Moved to namespace instea
 
 // Finally, here are the variables I want to change often and pull them all together here
 const int versionNumber = 9;                        // Increment this number each time the memory map is changed
-const char releaseNumber[6] = "0.1";               // Displays the release on the menu
+const char releaseNumber[6] = "0.2";               // Displays the release on the menu
 
 // Included Libraries
 #include "Adafruit_FRAM_I2C.h"        // Library for FRAM functions
@@ -45,7 +45,7 @@ const char releaseNumber[6] = "0.1";               // Displays the release on th
 #include "electrondoc.h"              // Documents pinout
 
 // Prototypes and System Mode calls
-SYSTEM_MODE(SEMI_AUTOMATIC);          // This will enable user code to start executing automatically.
+SYSTEM_MODE(MANUAL);          // This will enable user code to start executing automatically.
 SYSTEM_THREAD(ENABLED);               // Means my code will not be held up by Particle processes.
 STARTUP(System.enableFeature(FEATURE_RESET_INFO));
 FuelGauge batteryMonitor;             // Prototype for the fuel gauge (included in Particle core library)
@@ -71,7 +71,7 @@ const int blueLED =       D7;                     // This LED is on the Electron
 
 // Timing Variables
 unsigned long stayAwake;                          // This is the time before sleeping - can be short or long
-bool awokeFromNap=false;                          // Flag that napping was interrupted by interrupt not time
+const int wakeBoundary = 1*3600 + 0*60 + 0;         // 1 hour 0 minutes 0 seconds
 const unsigned long stayAwakeLong = 90000;        // In lowPowerMode, how long to stay awake every hour - long
 const unsigned long webhookWait = 45000;          // How long will we wair for a WebHook response
 const unsigned long resetWait = 30000;            // How long will we wait in ERROR_STATE until reset
@@ -85,6 +85,7 @@ unsigned long lastPublish = 0;
 // Program Variables
 int temperatureF;                                   // Global variable so we can monitor via cloud variable
 int resetCount;                                     // Counts the number of times the Electron has had a pin reset
+bool awokeFromNap =false;                           // Flag that napping was interrupted by interrupt not time
 bool ledState = LOW;                                // variable used to store the last LED status, to toggle the light
 bool readyForBed = false;                           // Checks to see if steps for sleep have been completed
 bool pettingEnabled = true;                         // Let's us pet the hardware watchdog
@@ -93,10 +94,8 @@ byte controlRegisterValue;                               // Stores the control r
 bool lowPowerMode;                                  // Flag for Low Power Mode operations
 bool solarPowerMode;                                // Changes the PMIC settings
 bool verboseMode;                                   // Enables more active communications for configutation and setup
-bool connectionMode;                                // Saves the connection state though a reset
 char SignalString[17];                              // Used to communicate Wireless RSSI and Description
 const char* levels[6] = {"Poor", "Low", "Medium", "Good", "Very Good", "Great"};
-volatile bool watchDogPet = false;                  // Take out after debug
 
 
 // Time Related Variables
@@ -129,8 +128,6 @@ float minTransit;                           // Ths is the minimum time needed to
 
 void setup()                                // Note: Disconnected Setup()
 {
-  Wire.begin();                             // Create a wire object
-
   pinMode(enablePin,OUTPUT);                // For GPS enabled units
   digitalWrite(enablePin,LOW);              // Turn off GPS to save battery
   pinMode(intPin,INPUT_PULLDOWN);           // PIR Sensor Interrupt pin
@@ -205,10 +202,6 @@ void setup()                                // Note: Disconnected Setup()
   // Here we load the values from FRAM
   minTransit = float(FRAMread8(FRAM::minTransitAddr))/10.0;           // The time to cross the sensor's field of view in seconds (PIR only)
   snprintf(minTransitStr,sizeof(minTransitStr),"%2.1f sec",minTransit);
-  Serial.print("The elements are minTransitAddr:");
-  Serial.print(FRAMread8(FRAM::minTransitAddr));
-  Serial.print(" and minTransit: ");
-  Serial.println(minTransit);
   maxGroup = FRAMread8(FRAM::maxGroupAddr);                           // How many people might walk together (PIR only)
   openTime = FRAMread8(FRAM::openTimeAddr);                           // Open time of the park (24 hour format)
   closeTime = FRAMread8(FRAM::closeTimeAddr);                         // Close time of the park (24 hr format)
@@ -222,13 +215,16 @@ void setup()                                // Note: Disconnected Setup()
   lowPowerMode    = (0b00000001 & controlRegisterValue);              // Set the lowPowerMode
   solarPowerMode  = (0b00000100 & controlRegisterValue);              // Set the solarPowerMode
   verboseMode     = (0b00001000 & controlRegisterValue);              // Set the verboseMode
-  connectionMode  = (0b00010000 & controlRegisterValue);              // connected mode 1 = connected and 0 = disconnected
 
   PMICreset();                                                        // Executes commands that set up the PMIC for Solar charging - once we know the Solar Mode
 
-  takeMeasurements();                                                 // For the benefit of monitoring the device
+  if ((0b00010000 & controlRegisterValue)) {
+    Particle.connect();                                                // Connects and turns stuff on
+    waitFor(Particle.connected, 20000);                               // Give us 20 seconds to connect
+    Particle.process();
+  }
 
-  if (connectionMode) connectToParticle();                            // If not lowpower or sleeping, we can connect
+  takeMeasurements();                                                 // For the benefit of monitoring the device
 
   currentHourlyPeriod = Time.hour();                                  // Sets the hour period for when the system starts
   currentDailyPeriod = Time.day();                                    // And the day
@@ -248,16 +244,20 @@ void setup()                                // Note: Disconnected Setup()
   attachInterrupt(intPin,sensorISR,CHANGE);                           // Will know when the PIR sensor is triggered
 
   if (!pinReadFast(userSwitch)) {                                     // Rescue mode to locally take lowPowerMode so you can connect to device
-    lowPowerMode = false;                                             // Press the user switch while resetting the device
-    controlRegisterValue = (0b11111110 & controlRegisterValue);       // Turn off Low power mode
-    controlRegisterValue = (0b00010000 | controlRegisterValue);       // Turn on the connectionMode
-    FRAMwrite8(FRAM::controlRegisterAddr,controlRegisterValue);       // Write it to the register
     openTime = 0;                                                     // Device may alos be sleeping due to time or TimeZone setting
     FRAMwrite8(FRAM::openTimeAddr,0);                                 // Reset open and close time values to ensure device is awake
     closeTime = 24;
     FRAMwrite8(FRAM::closeTimeAddr,24);
-    connectToParticle();                                              // Connects the Electron to Particle so you can control it
-    Particle.publish("Startup","Startup rescue - reset time and power");
+    controlRegisterValue = FRAMread8(FRAM::controlRegisterAddr);        // Get the control register (general approach)
+    controlRegisterValue = (0b11111110 & controlRegisterValue);      // If so, turn off the lowPowerMode bit
+    controlRegisterValue = (0b00010000 | controlRegisterValue);      // Turn on connected mode 1 = connected and 0 = disconnected
+    lowPowerMode = false;
+    Particle.connect();
+    waitFor(Particle.connected,10000);
+    Particle.process();
+    digitalWrite(tmp36Shutdwn, HIGH);                                // Turns on the temp sensor
+    FRAMwrite8(FRAM::controlRegisterAddr,controlRegisterValue);        // Write to the control register
+    if (Particle.connected()) Particle.publish("Startup","Startup rescue - reset time and power");
   }
 
   if (state != ERROR_STATE) state = IDLE_STATE;                       // IDLE unless error from above code
@@ -269,7 +269,7 @@ void loop()
 {
   switch(state) {
   case IDLE_STATE:
-    if (connectionMode && verboseMode && state != oldState) publishStateTransition();
+    if (verboseMode && state != oldState) publishStateTransition();
     if(hourlyPersonCountSent) {                                         // Cleared here as there could be counts coming in while "in Flight"
       hourlyPersonCount -= hourlyPersonCountSent;                       // Confirmed that count was recevied - clearing
       FRAMwrite16(FRAM::currentHourlyCountAddr, static_cast<uint16_t>(hourlyPersonCount));  // Load Hourly Count to memory
@@ -283,24 +283,29 @@ void loop()
     break;
 
   case SLEEPING_STATE: {                                                // This state is triggered once the park closes and runs until it opens
-    if (connectionMode && verboseMode && state != oldState) publishStateTransition();
+    if (verboseMode && state != oldState) publishStateTransition();
     if (!readyForBed)                                                   // Only do these things once - at bedtime
     {
+      detachInterrupt(intPin);                                          // Done sensing for the day
       if (hourlyPersonCount) {                                          // If this number is not zero then we need to send this last count
         state = REPORTING_STATE;
         break;
       }
-      if (Particle.connected()) {
-        Cellular.off();                                                 // If connected, we need to disconnet and power down the modem
-        delay(2000);                                                    // Advice from Rickkas - https://community.particle.io/t/electron-sleep-problems-yet-again/42230/11
+      if ((0b00010000 & controlRegisterValue)) {
+        controlRegisterValue = FRAMread8(FRAM::controlRegisterAddr);    // Get the control register (general approach)
+        controlRegisterValue = (0b00000001 | controlRegisterValue);     // If so, flip the lowPowerMode bit
+        controlRegisterValue = (0b11101111 & controlRegisterValue);     // Turn off connected mode 1 = connected and 0 = disconnected
+        FRAMwrite8(FRAM::controlRegisterAddr,controlRegisterValue);     // Write to the control register
+        lowPowerMode = true;
+        Cellular.off();
+        delay(1000);                                                    // Advice from Rickkas - https://community.particle.io/t/electron-sleep-problems-yet-again/42230/11
+        digitalWrite(blueLED,LOW);                                      // Turn off the LED
+        digitalWrite(tmp36Shutdwn, LOW);                                // Turns off the temp sensor
       }
-      detachInterrupt(intPin);                                          // Done sensing for the day
       FRAMwrite16(FRAM::currentDailyCountAddr, 0);                      // Reset the counts in FRAM
       FRAMwrite8(FRAM::resetCountAddr, 0);
       FRAMwrite16(FRAM::currentHourlyCountAddr, 0);
-      dailyPersonCount = resetCount = hourlyPersonCount = 0; // All the counts have been reported so time to zero everything
-      digitalWrite(blueLED,LOW);                                        // Turn off the LED
-      digitalWrite(tmp36Shutdwn, LOW);                                  // Turns off the temp sensor
+      dailyPersonCount = resetCount = hourlyPersonCount = 0;            // All the counts have been reported so time to zero everything
       watchdogISR();                                                    // Pet the watchdog
       readyForBed = true;                                               // Set the flag for the night
     }
@@ -309,14 +314,20 @@ void loop()
     } break;
 
   case NAPPING_STATE: {  // This state puts the device in low power mode quickly
-      if (connectionMode && verboseMode && state != oldState) publishStateTransition();
+      if (verboseMode && state != oldState) publishStateTransition();
       if (pinState) break;                                              // Don't nap until we are done with event
-      if (Particle.connected()) Cellular.off();                         // If connected, we need to disconned and power down the modem
-      digitalWrite(blueLED,LOW);                                        // Turn off the LED
+      if ((0b00010000 & controlRegisterValue)) {
+        Particle.disconnect();                                          // Otherwise Electron will attempt to reconnect on wake
+        controlRegisterValue = FRAMread8(FRAM::controlRegisterAddr);    // Get the control register (general approach)
+        controlRegisterValue = (0b11101111 & controlRegisterValue);     // Turn off connected mode 1 = connected and 0 = disconnected
+        Cellular.off();
+        delay(1000);                                                    // Bummer but only should happen once an hour
+        FRAMwrite8(FRAM::controlRegisterAddr,controlRegisterValue);     // Write to the control register
+      }
       watchdogISR();                                                    // Pet the watchdog
       stayAwake = minTransit*1000;                                      // Need to convert to millis
-      int secondsToHour = (60*(60 - Time.minute()));                    // Time till the top of the hour
-      System.sleep(intPin, RISING, secondsToHour);                      // Sensor will wake us with an interrupt or timeout at the hour
+      int wakeInSeconds = constrain(wakeBoundary - Time.now() % wakeBoundary, 1, wakeBoundary);
+      System.sleep(intPin, RISING, wakeInSeconds);                      // Sensor will wake us with an interrupt or timeout at the hour
       if (System.wokenUpByPin()) {
          awokeFromNap=true;                                             // Since millis() stops when sleeping - need this to debounce
          stayAwakeTimeStamp = millis();
@@ -325,26 +336,35 @@ void loop()
     } break;
 
   case LOW_BATTERY_STATE: {                                             // Sleep state but leaves the fuel gauge on
-      if (connectionMode && verboseMode && state != oldState) publishStateTransition();
-      if (Particle.connected()) Cellular.off();                         // If connected, we need to disconned and power down the modem
+      if (verboseMode && state != oldState) publishStateTransition();
       detachInterrupt(intPin);                                          // Done sensing for the day
-      digitalWrite(blueLED,LOW);                                        // Turn off the LED
-      digitalWrite(tmp36Shutdwn, LOW);                                  // Turns off the temp sensor
+      if ((0b00010000 & controlRegisterValue)) {
+        controlRegisterValue = FRAMread8(FRAM::controlRegisterAddr);    // Get the control register (general approach)
+        controlRegisterValue = (0b00000001 | controlRegisterValue);     // If so, flip the lowPowerMode bit
+        controlRegisterValue = (0b11101111 & controlRegisterValue);     // Turn off connected mode 1 = connected and 0 = disconnected
+        FRAMwrite8(FRAM::controlRegisterAddr,controlRegisterValue);     // Write to the control register
+        lowPowerMode = true;
+        Cellular.off();
+        delay(1000);                                                    // Advice from Rickkas - https://community.particle.io/t/electron-sleep-problems-yet-again/42230/11
+        digitalWrite(blueLED,LOW);                                      // Turn off the LED
+        digitalWrite(tmp36Shutdwn, LOW);                                // Turns off the temp sensor
+      }
       watchdogISR();                                                    // Pet the watchdog
       int secondsToHour = (60*(60 - Time.minute()));                    // Time till the top of the hour
       System.sleep(SLEEP_MODE_DEEP,secondsToHour);                      // Very deep sleep till the next hour - then resets
     } break;
 
-  case REPORTING_STATE:                                               // Reporting - hourly or on command
-    if (connectionMode && verboseMode && state != oldState) publishStateTransition();
+  case REPORTING_STATE:                                                 // Reporting - hourly or on command
+    if (verboseMode && state != oldState) publishStateTransition();
     watchdogISR();                                                      // Pet the watchdog once an hour
     pettingEnabled = false;                                             // Going to see the reporting process through before petting again
-    if (!Particle.connected()) {
-      if (!connectToParticle()) {
-        resetTimeStamp = millis();
-        state = ERROR_STATE;
-        break;
-      }
+    if (!(0b00010000 & controlRegisterValue)) {                         // If in disconnected mode
+      controlRegisterValue = FRAMread8(FRAM::controlRegisterAddr);      // Get the control register (general approach)
+      controlRegisterValue = (0b00010000 | controlRegisterValue);       // Turn on connected mode 1 = connected and 0 = disconnected
+      FRAMwrite8(FRAM::controlRegisterAddr,controlRegisterValue);       // Write to the control register
+      Particle.connect();
+      waitFor(Particle.connected,10000);
+      Particle.process();
     }
     takeMeasurements();                                                 // Update Temp, Battery and Signal Strength values
     sendEvent();                                                        // Send data to Ubidots
@@ -353,7 +373,7 @@ void loop()
     break;
 
   case RESP_WAIT_STATE:
-    if (connectionMode && verboseMode && state != oldState) publishStateTransition();
+    if (verboseMode && state != oldState) publishStateTransition();
     if (!dataInFlight)                                                  // Response received back to IDLE state
     {
       state = IDLE_STATE;
@@ -367,10 +387,10 @@ void loop()
     break;
 
   case ERROR_STATE:                                          // To be enhanced - where we deal with errors
-    if (connectionMode && verboseMode && state != oldState) publishStateTransition();
+    if (verboseMode && state != oldState) publishStateTransition();
     if (millis() > resetTimeStamp + resetWait)
     {
-      Particle.publish("State","ERROR_STATE - Resetting");  // Publish this regardless of Verbose Mode
+      if (Particle.connected()) Particle.publish("State","ERROR_STATE - Resetting");  // Publish this regardless of Verbose Mode
       delay(2000);                                          // This makes sure it goes through before reset
       if (resetCount <= 3)  System.reset();                 // Today, only way out is reset
       else {
@@ -380,6 +400,7 @@ void loop()
     }
     break;
   }
+  Particle.process();
 }
 
 void recordCount()                                          // Handles counting when the sensor triggers
@@ -389,47 +410,37 @@ void recordCount()                                          // Handles counting 
   if (pinState) {
     if ((millis() >= startDetect + minTransit*1000 || awokeFromNap)) {
     startDetect = currentEvent;
-  //  Serial.print("Start = ");
-  //  Serial.print(startDetect);
     }
   }
   else if (!pinState) {                                     // 1st attempt will fail if there are too many retriggers
     if (awokeFromNap) currentEvent+=minTransit*1000;
     stopDetect = currentEvent;
-  //  Serial.print(" Stop = ");
-  //  Serial.print(stopDetect);
-  //  Serial.print(" Stop-Start = ");
-//    Serial.println(stopDetect-startDetect);
     float timeLapsed = (stopDetect - startDetect) / 1000.0;   // This is the time between this event and last
     if (minTransit == 0) minTransit = 1.0;                 // Cannot allow a divide by zero here
-  //  Serial.print("timeLapsed: ");
-  //  Serial.print(timeLapsed);
-//    Serial.print("sec and minTransit: ");
-  //  Serial.print(minTransit);
-  //  Serial.print("sec so timeLapsed / minTransit = ");
-  //  Serial.println(timeLapsed/minTransit);
     int peopleInGroup = constrain(int(timeLapsed / minTransit),1,maxGroup);   // This will count multiples if longer signal
     hourlyPersonCount += peopleInGroup;
     dailyPersonCount += peopleInGroup;
     FRAMwrite16(FRAM::currentHourlyCountAddr, static_cast<uint16_t>(hourlyPersonCount));  // Load Hourly Count to memory
     FRAMwrite16(FRAM::currentDailyCountAddr, static_cast<uint16_t>(dailyPersonCount));   // Load Daily Count to memory
-    snprintf(transitTimeStr, sizeof(transitTimeStr),"%2.1f sec",timeLapsed);
-    if (verboseMode) {                                          // Publish if we are in verbose mode
+    if (verboseMode && !lowPowerMode) {                                          // Publish if we are in verbose mode
+      snprintf(transitTimeStr, sizeof(transitTimeStr),"%2.1f sec",timeLapsed);
       snprintf(data, sizeof(data), "Group of %i so %i hourly and transit of %2.1f seconds", peopleInGroup,hourlyPersonCount,timeLapsed);
-      Particle.publish("Count",data);                     // Don't meter this publish as it cold mess with timing
+      if (Particle.connected()) Particle.publish("Count",data);                     // Don't meter this publish as it cold mess with timing
     }
-//    Serial.println(data);
   }
   awokeFromNap = false;                                    // Reset the flag
   if (!pinReadFast(userSwitch) && lowPowerMode) {          // A low value means someone is pushing this button take out of low power mode
     lowPowerMode = false;
-    connectionMode = true;
-    connectToParticle();                                 // Reconnect to Particle for monitoring and management
-    Particle.publish("Mode","Normal Operations");
-    controlRegisterValue = FRAMread8(FRAM::controlRegisterAddr);    // Load the control register contents
-    controlRegisterValue = (0b11111110 & controlRegisterValue);     // Will set the lowPowerMode bit to zero
-    controlRegisterValue = (0b00010000 | controlRegisterValue);     // Turn on the connectionMode
-    FRAMwrite8(FRAM::controlRegisterAddr,controlRegisterValue);
+    controlRegisterValue = FRAMread8(FRAM::controlRegisterAddr);        // Get the control register (general approach)
+    controlRegisterValue = (0b11111110 & controlRegisterValue);      // If so, turn off the lowPowerMode bit
+    controlRegisterValue = (0b00010000 | controlRegisterValue);      // Turn on connected mode 1 = connected and 0 = disconnected
+    lowPowerMode = false;
+    Particle.connect();
+    waitFor(Particle.connected,10000);
+    Particle.process();
+    digitalWrite(tmp36Shutdwn, HIGH);                                // Turns on the temp sensor
+    FRAMwrite8(FRAM::controlRegisterAddr,controlRegisterValue);        // Write to the control register
+    if (Particle.connected()) Particle.publish("Mode","User Button in recordCount");
   }
 }
 
@@ -446,7 +457,7 @@ void sendEvent()
 void UbidotsHandler(const char *event, const char *data)  // Looks at the response from Ubidots - Will reset Photon if no successful response
 {
   // Response Template: "{{hourly.0.status_code}}" so, I should only get a 3 digit number back
-  char dataCopy[strlen(data)+1];                        // data needs to be copied since Particle.publish() will clear it
+  char dataCopy[strlen(data)+1];                        // data needs to be copied since if (Particle.connected()) Particle.publish() will clear it
   strncpy(dataCopy, data, sizeof(dataCopy));            // Copy - overflow safe
   if (!strlen(dataCopy)) return;                        // First check to see if there is any data
   int responseCode = atoi(dataCopy);                    // Response is only a single number thanks to Template
@@ -454,7 +465,7 @@ void UbidotsHandler(const char *event, const char *data)  // Looks at the respon
   {
     if (verboseMode) {
       waitUntil(meterParticlePublish);
-      Particle.publish("State","Response Received");
+      if (Particle.connected()) Particle.publish("State","Response Received");
       lastPublish = millis();
     }
     dataInFlight = false;                                 // Data has been received
@@ -462,7 +473,7 @@ void UbidotsHandler(const char *event, const char *data)  // Looks at the respon
   else {
     if (verboseMode) {
       waitUntil(meterParticlePublish);
-      Particle.publish("Ubidots Hook", dataCopy);       // Publish the response code
+      if (Particle.connected()) Particle.publish("Ubidots Hook", dataCopy);       // Publish the response code
       lastPublish = millis();
     }
   }
@@ -501,14 +512,8 @@ void sensorISR()
   sensorDetect = true;                              // sets the sensor flag for the main loop
   currentEvent = millis();                        // Time in time_t of the interrupt
   pinState = pinReadFast(intPin);                   // Capture the state of the pin
-  if (pinState) {
-    pinSetFast(intPinMirror);
-    pinSetFast(blueLED);
-  }
-  else {
-    pinResetFast(intPinMirror);
-    pinResetFast(blueLED);
-  }
+  if (pinState) pinSetFast(blueLED);
+  else pinResetFast(blueLED);
 }
 
 void watchdogISR()
@@ -516,25 +521,7 @@ void watchdogISR()
   if (pettingEnabled) {
     digitalWrite(donePin, HIGH);                      // Pet the watchdog
     digitalWrite(donePin, LOW);
-    watchDogPet = true;
   }
-}
-
-// These functions control the connection and disconnection from Particle
-
-bool connectToParticle()
-{
-  if (!Cellular.ready())
-  {
-    Cellular.on();                                           // turn on the Modem
-    Cellular.connect();                                      // Connect to the cellular network
-    if(!waitFor(Cellular.ready,90000)) return false;         // Connect to cellular - give it 90 seconds
-  }
-  Particle.process();
-  Particle.connect();                                      // Connect to Particle
-  if(!waitFor(Particle.connected,30000)) return false;     // Connect to Particle - give it 30 seconds
-  Particle.process();
-  return true;
 }
 
 bool notConnected() {
@@ -617,7 +604,7 @@ int setMinTransit(String command)  // This is the amount of time in seconds we w
   if (verboseMode) {
     waitUntil(meterParticlePublish);
     snprintf(data, sizeof(data), "Minimum Transit: %2.1f seconds",minTransit);
-    Particle.publish("Variables",data);
+    if (Particle.connected()) Particle.publish("Variables",data);
     lastPublish = millis();
   }
   return 1;
@@ -634,7 +621,7 @@ int setMaxGroup(String command)  // This is the amount of time in seconds we wil
   if (verboseMode) {
     waitUntil(meterParticlePublish);
     snprintf(data, sizeof(data), "Max Group Size: %i people",maxGroup);
-    Particle.publish("Variables",data);
+    if (Particle.connected()) Particle.publish("Variables",data);
     lastPublish = millis();
   }
   return 1;
@@ -661,7 +648,7 @@ int setSolarMode(String command) // Function to force sending data in current ho
     PMICreset();                                               // Change the power management Settings
     if (verboseMode) {
       waitUntil(meterParticlePublish);
-      Particle.publish("Mode","Set Solar Powered Mode");
+      if (Particle.connected()) Particle.publish("Mode","Set Solar Powered Mode");
       lastPublish = millis();
     }
     return 1;
@@ -675,7 +662,7 @@ int setSolarMode(String command) // Function to force sending data in current ho
     PMICreset();                                                // Change the power management settings
     if (verboseMode) {
       waitUntil(meterParticlePublish);
-      Particle.publish("Mode","Cleared Solar Powered Mode");
+      if (Particle.connected()) Particle.publish("Mode","Cleared Solar Powered Mode");
       lastPublish = millis();
     }
     return 1;
@@ -693,7 +680,7 @@ int setVerboseMode(String command) // Function to force sending data in current 
     FRAMwrite8(FRAM::controlRegisterAddr,controlRegisterValue);                        // Write it to the register
     if (verboseMode) {
       waitUntil(meterParticlePublish);
-      Particle.publish("Mode","Set Verbose Mode");
+      if (Particle.connected()) Particle.publish("Mode","Set Verbose Mode");
       lastPublish = millis();
     }
     return 1;
@@ -706,7 +693,7 @@ int setVerboseMode(String command) // Function to force sending data in current 
     FRAMwrite8(FRAM::controlRegisterAddr,controlRegisterValue);                        // Write it to the register
     if (verboseMode) {
       waitUntil(meterParticlePublish);
-      Particle.publish("Mode","Cleared Verbose Mode");
+      if (Particle.connected()) Particle.publish("Mode","Cleared Verbose Mode");
       lastPublish = millis();
     }
     return 1;
@@ -726,9 +713,9 @@ int setTimeZone(String command)
     waitUntil(meterParticlePublish);
     t = Time.now();
     snprintf(data, sizeof(data), "Time zone offset %i",tempTimeZoneOffset);
-    Particle.publish("Time",data);
+    if (Particle.connected()) Particle.publish("Time",data);
     delay(1000);
-    Particle.publish("Time",Time.timeStr(t));
+    if (Particle.connected()) Particle.publish("Time",Time.timeStr(t));
     lastPublish = millis();
   }
   return 1;
@@ -745,7 +732,7 @@ int setOpenTime(String command)
     char data[256];
     waitUntil(meterParticlePublish);
     snprintf(data, sizeof(data), "Open time set to %i",openTime);
-    Particle.publish("Time",data);
+    if (Particle.connected()) Particle.publish("Time",data);
     lastPublish = millis();
   }
   return 1;
@@ -762,7 +749,7 @@ int setCloseTime(String command)
     char data[256];
     waitUntil(meterParticlePublish);
     snprintf(data, sizeof(data), "Closing time set to %i",closeTime);
-    Particle.publish("Time",data);
+    if (Particle.connected()) Particle.publish("Time",data);
     lastPublish = millis();
   }
   return 1;
@@ -772,32 +759,34 @@ int setCloseTime(String command)
 int setLowPowerMode(String command)                                   // This is where we can put the device into low power mode if needed
 {
   if (command != "1" && command != "0") return 0;                     // Before we begin, let's make sure we have a valid input
-  controlRegisterValue = FRAMread8(FRAM::controlRegisterAddr);        // Get the control register (general approach)
   if (command == "1")                                                 // Command calls for setting lowPowerMode
   {
     if (verboseMode) {
       waitUntil(meterParticlePublish);
-      Particle.publish("Mode","Low Power");
+      if (Particle.connected()) Particle.publish("Mode","Low Power");
       lastPublish = millis();
     }
-    controlRegisterValue = (0b00000001 | controlRegisterValue);       // If so, flip the lowPowerMode bit
-    controlRegisterValue = (0b11101111 & controlRegisterValue);       // Turn off connected mode 1 = connected and 0 = disconnected
+    controlRegisterValue = FRAMread8(FRAM::controlRegisterAddr);      // Get the control register (general approach)
+    controlRegisterValue = (0b00000001 | controlRegisterValue);       // Flip the lowPowerMode bit
+    FRAMwrite8(FRAM::controlRegisterAddr,controlRegisterValue);       // Write to the control register
     lowPowerMode = true;
-    connectionMode = false;
   }
-  else if (command == "0")                                            // Command calls for clearing lowPowerMode
+  else                                                                // Command calls for clearing lowPowerMode
   {
     if (verboseMode) {
       waitUntil(meterParticlePublish);
-      Particle.publish("Mode","Normal Operations");
+      if (Particle.connected()) Particle.publish("Mode","Normal Operations");
       lastPublish = millis();
     }
-    controlRegisterValue = (0b11111110 & controlRegisterValue);      // If so, turn off the lowPowerMode bit
-    controlRegisterValue = (0b00010000 | controlRegisterValue);      // Turn on connected mode 1 = connected and 0 = disconnected
+    controlRegisterValue = FRAMread8(FRAM::controlRegisterAddr);      // Get the control register (general approach)
+    controlRegisterValue = (0b11111110 & controlRegisterValue);       // If so, turn off the lowPowerMode bit
+    controlRegisterValue = (0b00010000 | controlRegisterValue);       // Turn on connected mode 1 = connected and 0 = disconnected
+    FRAMwrite8(FRAM::controlRegisterAddr,controlRegisterValue);       // Write to the control register
     lowPowerMode = false;
-    connectionMode = true;
+    Particle.connect();
+    waitFor(Particle.connected,10000);
+    Particle.process();
   }
-  FRAMwrite8(FRAM::controlRegisterAddr,controlRegisterValue);        // Write to the control register
   return 1;
 }
 
@@ -813,6 +802,6 @@ void publishStateTransition(void)
   snprintf(stateTransitionString, sizeof(stateTransitionString), "From %s to %s", stateNames[oldState],stateNames[state]);
   oldState = state;
   waitUntil(meterParticlePublish);
-  Particle.publish("State Transition",stateTransitionString);
+  if (Particle.connected()) Particle.publish("State Transition",stateTransitionString);
   lastPublish = millis();
 }

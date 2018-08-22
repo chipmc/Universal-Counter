@@ -6,7 +6,6 @@ Adafruit_FRAM_I2C fram = Adafruit_FRAM_I2C(); // Init the FRAM
 uint8_t FRAMread8(unsigned int address)  // Read 8 bits from FRAM
 {
     uint8_t result;
-    //Serial.println("In FRAMread8");
     result = fram.read8(address);
     return result;
 }
@@ -77,13 +76,13 @@ void ResetFRAM()  // This will reset the FRAM - set the version and preserve del
 {
     // Note - have to hard code the size here due to this issue - http://www.microchip.com/forums/m501193.aspx
     byte tempControlReg = FRAMread8(FRAM::controlRegisterAddr);
-    Particle.publish("FRAM","Resetting in progress");
+    if (Particle.connected()) Particle.publish("FRAM","Resetting in progress");
     for (unsigned long i=8; i < 32768; i++) {  // Start at 4 to not overwrite debounce and sensitivity
         FRAMwrite8(i,0x0);
-        if (i==8192) Particle.publish("Event", "Fram Reset 1/4 done");
-        if (i==16384) Particle.publish("Event", "Fram Reset 1/2 done");
-        if (i==(24576)) Particle.publish("Event", "Fram Reset 3/4 done");
-        if (i==32767) Particle.publish("Event", "Fram Reset done");
+        if (i==8192) if (Particle.connected()) Particle.publish("Event", "Fram Reset 1/4 done");
+        if (i==16384) if (Particle.connected()) Particle.publish("Event", "Fram Reset 1/2 done");
+        if (i==(24576)) if (Particle.connected()) Particle.publish("Event", "Fram Reset 3/4 done");
+        if (i==32767) if (Particle.connected()) Particle.publish("Event", "Fram Reset done");
     }
     FRAMwrite8(FRAM::controlRegisterAddr,tempControlReg);   // Preserce the control register values
     FRAMwrite8(FRAM::versionAddr,versionNumber);  // Reset version to match #define value for sketch
